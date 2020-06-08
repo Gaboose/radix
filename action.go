@@ -409,51 +409,45 @@ func (ec *evalAction) ClusterCanRetry() bool {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-type marshalerUnmarshaler struct {
+type pipelineMarshalerUnmarshaler struct {
 	resp.Marshaler
 	resp.Unmarshaler
+
+	err error
 }
 
-type pipelineConn struct {
+// TODO this could use a sync.Pool probably
+type pipeline struct {
+	cmds []CmdAction
+	mm   []pipelineMarshalerUnmarshaler
+
+	// Conn is only set during the Perform method. It's primary purpose is to
+	// provide for the methods which aren't EncodeDecode during the inner
+	// Actions' Perform calls, in the unlikely event that they are needed.
 	Conn
-	mm []marshalerUnmarshaler
 }
-
-func (pc *pipelineConn) EncodeDecode(m resp.Marshaler, u resp.Unmarshaler) error {
-	pc.mm = append(pc.mm, marshalerUnmarshaler{Marshaler: m, Unmarshaler: u})
-	return nil
-}
-
-func (pc *pipelineConn) numUnmarshalersAfter(idx int) int {
-	var n int
-	for i := idx + 1; i < len(pc.mm); i++ {
-		if pc.mm[i].Unmarshaler != nil {
-			n++
-		}
-	}
-	return n
-}
-
-type pipeline []CmdAction
 
 // Pipeline returns an Action which first writes multiple commands to a Conn in
 // a single write, then reads their responses in a single read. This reduces
 // network delay into a single round-trip.
-//
-// Perform will not be called on any of the passed in CmdActions.
 //
 // NOTE that, while a Pipeline performs all commands on a single Conn, it
 // shouldn't be used by itself for MULTI/EXEC transactions, because if there's
 // an error it won't discard the incomplete transaction. Use WithConn or
 // EvalScript for transactional functionality instead.
 func Pipeline(cmds ...CmdAction) Action {
-	return pipeline(cmds)
+	return &pipeline{
+		cmds: cmds,
+		mm:   make([]pipelineMarshalerUnmarshaler, 0, len(cmds)),
+	}
 }
 
-func (p pipeline) Keys() []string {
+var _ Conn = new(pipeline)
+
+func (p *pipeline) Keys() []string {
 	m := map[string]bool{}
-	for _, rc := range p {
-		for _, k := range rc.Keys() {
+	for _, cmd := range p.cmds {
+		for _, k := range cmd.Keys() {
 			m[k] = true
 		}
 	}
@@ -464,56 +458,106 @@ func (p pipeline) Keys() []string {
 	return keys
 }
 
-func (p pipeline) drain(conn Conn, n int) error {
-	for i := 0; i < n; i++ {
-		if err := conn.EncodeDecode(nil, resp2.Any{}); err != nil {
-			return err
+func (p *pipeline) EncodeDecode(m resp.Marshaler, u resp.Unmarshaler) error {
+	p.mm = append(p.mm, pipelineMarshalerUnmarshaler{
+		Marshaler: m, Unmarshaler: u,
+	})
+	return nil
+}
+
+func (p *pipeline) setErr(startingAt int, err error) {
+	for i := startingAt; i < len(p.mm); i++ {
+		p.mm[i].err = err
+	}
+}
+
+func (p *pipeline) MarshalRESP(w io.Writer) error {
+	for i := range p.mm {
+		if p.mm[i].Marshaler == nil {
+			continue
+		} else if err := p.mm[i].Marshaler.MarshalRESP(w); err == nil {
+			continue
+		} else {
+			p.setErr(i, err)
+			break
 		}
 	}
 	return nil
 }
 
-func (p pipeline) Perform(c Conn) error {
-	pc := pipelineConn{
-		Conn: c,
-		// TODO this could probably use a Pool
-		mm: make([]marshalerUnmarshaler, 0, len(p)),
-	}
-	for i := range p {
-		// any errors that happen within Perform will not be IO errors, because
-		// pipelineConn is suppressing all potential IO.
-		if err := p[i].Perform(&pc); err != nil {
-			return err
-		}
-	}
-
-	for _, m := range pc.mm {
-		if m.Marshaler == nil {
+func (p *pipeline) UnmarshalRESP(br *bufio.Reader) error {
+	for i := range p.mm {
+		if p.mm[i].Unmarshaler == nil || p.mm[i].err != nil {
 			continue
-		}
-		if err := c.EncodeDecode(m.Marshaler, nil); err != nil {
-			return err
-		}
-	}
-
-	for i, m := range pc.mm {
-		if m.Unmarshaler == nil {
+		} else if err := p.mm[i].Unmarshaler.UnmarshalRESP(br); err == nil {
 			continue
-		}
-		if err := c.EncodeDecode(nil, m.Unmarshaler); err != nil {
-			if errors.As(err, new(resp.ErrDiscarded)) {
-				if drainErr := p.drain(c, pc.numUnmarshalersAfter(i)); drainErr != nil {
-					err = drainErr
-				}
-			}
-			// TODO this used to return a useful error describing which of the
-			// commands failed, mostly for the case of an application error like
-			// WRONGTYPE.
-			return err
+		} else if errors.As(err, new(resp.ErrDiscarded)) {
+			p.mm[i].err = err
+			continue
+		} else {
+			p.setErr(i, err)
+			break
 		}
 	}
-
 	return nil
+}
+
+func (p *pipeline) Perform(c Conn) error {
+	p.Conn = c
+	defer func() { p.Conn = nil }()
+
+	for _, cmd := range p.cmds {
+		// any errors that happen within Perform will not be IO errors, because
+		// pipelineConn is suppressing all potential IO errors
+		if err := cmd.Perform(p); err != nil {
+			return err
+		}
+	}
+
+	// pipeline's Marshal/UnmarshalRESP methods don't return an error, but
+	// instead swallow any errors they come across. If EncodeDecode returns an
+	// error it means something else the Conn was doing errored (like flushing
+	// its write buffer). There's not much to be done except return that error
+	// for all pipelineMarshalerUnmarshalers.
+	if err := c.EncodeDecode(p, p); err != nil {
+		p.setErr(0, err)
+		return err
+	}
+
+	// look through any errors encountered, if any. Perform will only return the
+	// first error encountered, but it does take into account all the others
+	// when determining if that error should be wrapped in ErrDiscarded.
+	//
+	// TODO this used to return a useful error describing which of the
+	// commands failed, mostly for the case of an application error like
+	// WRONGTYPE.
+	var err error
+	var errDiscarded resp.ErrDiscarded
+	allDiscarded := true
+	for _, m := range p.mm {
+		if m.err == nil {
+			continue
+		} else if m.err != nil {
+			err = m.err
+		}
+		if !errors.As(m.err, &errDiscarded) {
+			allDiscarded = false
+		}
+	}
+
+	// unwrap the error if not all of the errors encountered were discarded.
+	// Unwrapping is done within a for loop in case the error has multiple
+	// levels of ErrDiscarded (somehow).
+	//
+	// TODO there's probably a more elegant way to do this with errors.Unwrap
+	for {
+		if err != nil && !allDiscarded && errors.As(err, &errDiscarded) {
+			err = errDiscarded.Err
+		} else {
+			break
+		}
+	}
+	return err
 }
 
 ////////////////////////////////////////////////////////////////////////////////
